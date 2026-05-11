@@ -667,7 +667,7 @@ async function scanChangedFiles(): Promise<void> {
 
       outputChannel.appendLine(`\n${'─'.repeat(60)}`);
       outputChannel.appendLine(`Done · ${allIssues.length} total issue(s)`);
-      applyDiagnostics(allIssues, workspaceRoot);
+      applyDiagnostics(allIssues, workspaceRoot, files);
       const sarif = generateSarif(allIssues, config.model, 'changed');
       const sarifPath = await writeSarifReport(sarif, workspaceRoot);
       reportResults(allIssues, sarifPath);
@@ -947,8 +947,17 @@ function safePos(line: unknown, col: unknown): vscode.Position {
   return new vscode.Position(l, c);
 }
 
-function applyDiagnostics(issues: any[], workspaceRoot: string): void {
-  diagnosticCollection.clear();
+function applyDiagnostics(issues: any[], workspaceRoot: string, scannedFiles?: string[]): void {
+  if (scannedFiles) {
+    // Partial update: only wipe diagnostics for files that were actually re-scanned.
+    // All other files keep their existing diagnostics.
+    for (const relFile of scannedFiles) {
+      const absFile = path.resolve(workspaceRoot, relFile);
+      diagnosticCollection.set(vscode.Uri.file(absFile), []);
+    }
+  } else {
+    diagnosticCollection.clear();
+  }
   const diagnosticsMap = new Map<string, vscode.Diagnostic[]>();
 
   for (const issue of issues) {
