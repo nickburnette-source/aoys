@@ -403,9 +403,10 @@ let outputChannel: vscode.OutputChannel;
 let scanInProgress = false;
 let modelCache: { baseUrl: string; model: string } | null = null;
 let extensionContext: vscode.ExtensionContext | undefined;
-let issueStore: any[] = [];                          // canonical set of all current issues (all files)
-let pendingSaveFiles: Set<string> = new Set();       // files saved since last auto-scan debounce
-let saveDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+let issueStore: any[] = [];                                        // canonical set of all current issues (all files)
+let fileHashCache: Map<string, string> = new Map();               // relPath → hash at last completed per-file scan
+let pendingScanHash: Map<string, string> = new Map();             // relPath → hash of in-flight per-file scan
+let activeScanControllers: Map<string, AbortController> = new Map(); // relPath → abort controller for in-flight scan
 
 const DIAGNOSTICS_STORAGE_KEY = 'aoys.diagnostics.v1';
 
@@ -452,61 +453,40 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  // Track which documents are being manually saved so we can gate the auto-scan.
-  // Maps uri → timestamp so stale entries (from saves that failed before onDidSave fired)
-  // are ignored; entries are always deleted in onDidSave regardless of workspace membership.
-  const manualSaveUris = new Map<string, number>();
-  const MANUAL_SAVE_TTL_MS = 5000;
-  context.subscriptions.push(
-    vscode.workspace.onWillSaveTextDocument(event => {
-      if (event.reason === vscode.TextDocumentSaveReason.Manual) {
-        manualSaveUris.set(event.document.uri.toString(), Date.now());
-      }
-    })
-  );
-
-  // Auto-scan on save: accumulate saved files, debounce 3s, then run incremental scan.
-  // Uses a named function so the timer can reschedule itself if a scan is already running.
-  const triggerSaveScan = () => {
-    saveDebounceTimer = undefined;
-    if (pendingSaveFiles.size === 0) { return; }
-    if (scanInProgress) {
-      // A scan is running; check again in 10s rather than dropping the queued files.
-      saveDebounceTimer = setTimeout(triggerSaveScan, 10000);
-      return;
-    }
-    const filesToScan = [...pendingSaveFiles];
-    pendingSaveFiles.clear();
-    withScanLock(() => scanChangedFiles(filesToScan));
-  };
-
+  // Auto-scan on save: fire immediately on every save, gated by content hash.
+  // Scanning is per-file and independent of the global scan lock; any in-flight
+  // scan for the same file is aborted first so stale-content results are never applied.
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument(doc => {
-      const uriKey = doc.uri.toString();
-      const autoScanMode = vscode.workspace.getConfiguration('aoys').get<string>('autoScanOnSave') ?? 'onManualSave';
-
-      // Always delete to prevent leaks (non-workspace files, failed saves that re-saved later, etc.).
-      const savedAt = manualSaveUris.get(uriKey);
-      manualSaveUris.delete(uriKey);
-
-      // Gate by save reason unless the user has opted into scanning on any save.
-      if (autoScanMode === 'onManualSave') {
-        // Reject if not a manual save, or if the marker is stale (save previously failed).
-        if (savedAt === undefined || Date.now() - savedAt > MANUAL_SAVE_TTL_MS) { return; }
-      }
-
-      // Use getWorkspaceFolder for safe membership check (avoids path-prefix false-positives).
       const folder = vscode.workspace.getWorkspaceFolder(doc.uri);
       if (!folder) { return; }
-
       const root = folder.uri.fsPath;
       const relPath = path.relative(root, doc.uri.fsPath).replace(/\\/g, '/');
-      // Only cheap synchronous checks here — .aoysignore filtering happens inside scanChangedFiles.
       if (BINARY_EXT_RE.test(relPath) || ALWAYS_SKIP_BASENAMES.has(path.basename(relPath))) { return; }
 
-      pendingSaveFiles.add(relPath);
-      if (saveDebounceTimer) { clearTimeout(saveDebounceTimer); }
-      saveDebounceTimer = setTimeout(triggerSaveScan, 3000);
+      const hash = hashContent(doc.getText());
+
+      // Already scanned this exact content — nothing to do.
+      if (fileHashCache.get(relPath) === hash) { return; }
+      // Already have this content queued or in-flight — don't duplicate.
+      if (pendingScanHash.get(relPath) === hash) { return; }
+
+      // Cancel any in-flight scan for this file (content has changed).
+      activeScanControllers.get(relPath)?.abort();
+      activeScanControllers.delete(relPath);
+
+      // If a global manual scan is running, don't start a conflicting per-file scan.
+      // Invalidate the cache so the manual scan's completed result is not shadowed.
+      if (scanInProgress) {
+        fileHashCache.delete(relPath);
+        pendingScanHash.delete(relPath);
+        return;
+      }
+
+      pendingScanHash.set(relPath, hash);
+      const controller = new AbortController();
+      activeScanControllers.set(relPath, controller);
+      runPerFileScan(relPath, hash, controller, root);
     })
   );
 
@@ -652,6 +632,73 @@ async function selectModel(): Promise<void> {
   vscode.window.showInformationMessage(`AOYS: Model set to "${picked.label}"`);
 }
 
+// Per-file scan triggered by save events. Runs independently of the global scan lock
+// so that a manual "scan changed files" command and per-file saves don't block each other.
+async function runPerFileScan(relPath: string, expectedHash: string, controller: AbortController, workspaceRoot: string): Promise<void> {
+  const cleanup = (completed: boolean) => {
+    // Only remove our own entries — a newer scan may have replaced them.
+    if (activeScanControllers.get(relPath) === controller) { activeScanControllers.delete(relPath); }
+    if (pendingScanHash.get(relPath) === expectedHash) {
+      pendingScanHash.delete(relPath);
+      if (completed) { fileHashCache.set(relPath, expectedHash); }
+    }
+  };
+
+  if (controller.signal.aborted) { cleanup(false); return; }
+
+  const config = await getConfig();
+  if (!config || controller.signal.aborted) { cleanup(false); return; }
+
+  const aoysIgnorePatterns = loadAoysIgnorePatterns(workspaceRoot);
+  if (shouldSkipFile(relPath, aoysIgnorePatterns)) { cleanup(false); return; }
+
+  const language = detectLanguage(relPath);
+  if (language !== 'generic') { await fetchRulesForLanguage(language); }
+  if (controller.signal.aborted) { cleanup(false); return; }
+  const rules = rulesCache.get(language) ?? [];
+
+  let document: vscode.TextDocument;
+  try {
+    document = await vscode.workspace.openTextDocument(path.join(workspaceRoot, relPath));
+  } catch {
+    cleanup(false); return;
+  }
+
+  // Bail if content changed between save event and now — another save will follow.
+  if (hashContent(document.getText()) !== expectedHash) { cleanup(false); return; }
+  if (controller.signal.aborted) { cleanup(false); return; }
+
+  const content = document.getText();
+  try {
+    const git = simpleGit(workspaceRoot);
+    const diff = await git.diff([relPath]).catch(() => '');
+    if (controller.signal.aborted) { cleanup(false); return; }
+
+    const issues = await auditFile(
+      config, relPath,
+      buildDiffScanPrompt(relPath, content, diff, language, rules),
+      undefined, undefined, relPath,
+      controller.signal
+    );
+
+    if (controller.signal.aborted) { cleanup(false); return; }
+    // If a global manual scan started while we were running, let it win — it will produce
+    // a fresh result for this file and calling applyDiagnostics here would just cause flicker.
+    if (scanInProgress) { cleanup(false); return; }
+
+    applyDiagnostics(issues, workspaceRoot, [relPath]);
+    cleanup(true);
+
+    outputChannel.appendLine(`\nAOYS · ${relPath}: ${issues.length} issue(s) (on save)`);
+    issues.forEach(iss => outputChannel.appendLine(`  [${iss.severity}] ${iss.message} (line ${iss.startLine})`));
+  } catch (err: any) {
+    if (err.name !== 'AbortError' && err.message !== 'cancelled by user') {
+      outputChannel.appendLine(`\nAOYS · ${relPath}: scan error: ${err.message}`);
+    }
+    cleanup(false);
+  }
+}
+
 async function scanChangedFiles(specificFiles?: string[]): Promise<void> {
   const workspaceRoot = getWorkspaceRoot();
   if (!workspaceRoot) {
@@ -737,6 +784,7 @@ async function scanChangedFiles(specificFiles?: string[]): Promise<void> {
             }
           }, prefix);
           allIssues.push(...issues);
+          fileHashCache.set(file, hashContent(document.getText())); // prevent save handler re-scanning same content
           const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
           outputChannel.appendLine(`[${prefix}]     ✓ ${issues.length} issue(s) · ${elapsed}s`);
           issues.forEach(iss => outputChannel.appendLine(`[${prefix}]       [${iss.severity}] ${iss.message} (line ${iss.startLine})`));
@@ -873,6 +921,7 @@ async function scanFullProject(): Promise<void> {
           }, prefix);
           allIssues.push(...issues);
           scanCache[relFile] = { hash, issues, ts: new Date().toISOString() };
+          fileHashCache.set(relFile, hash); // prevent save handler re-scanning same content
           const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
           outputChannel.appendLine(`[${prefix}]     ✓ ${issues.length} issue(s) · ${elapsed}s`);
           issues.forEach(iss => outputChannel.appendLine(`[${prefix}]       [${iss.severity}] ${iss.message} (line ${iss.startLine})`));
@@ -898,9 +947,11 @@ async function scanFullProject(): Promise<void> {
   await saveScanCache(scanCache, workspaceRoot, relFiles);
 }
 
-async function auditFile(config: AuditConfig, _file: string, userPrompt: string, cancelToken?: vscode.CancellationToken, onThinking?: (text: string) => void, logPrefix?: string): Promise<any[]> {
+async function auditFile(config: AuditConfig, _file: string, userPrompt: string, cancelToken?: vscode.CancellationToken, onThinking?: (text: string) => void, logPrefix?: string, extraAbortSignal?: AbortSignal): Promise<any[]> {
   const controller = new AbortController();
   const cancelSub = cancelToken?.onCancellationRequested(() => controller.abort());
+  // Allow per-file scan cancellation (e.g., when the file is re-saved before scan completes).
+  extraAbortSignal?.addEventListener('abort', () => controller.abort(), { once: true });
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
   try {
@@ -1095,9 +1146,7 @@ function applyDiagnostics(issues: any[], workspaceRoot: string, scannedFiles?: s
 }
 
 export function deactivate() {
-  if (saveDebounceTimer) {
-    clearTimeout(saveDebounceTimer);
-    saveDebounceTimer = undefined;
-  }
-  pendingSaveFiles.clear();
+  for (const ctrl of activeScanControllers.values()) { ctrl.abort(); }
+  activeScanControllers.clear();
+  pendingScanHash.clear();
 }

@@ -57,16 +57,6 @@
           "minimum": 1,
           "maximum": 10,
           "description": "Number of files to scan concurrently during a full or changed-file scan."
-        },
-        "aoys.autoScanOnSave": {
-          "type": "string",
-          "default": "onManualSave",
-          "enum": ["onManualSave", "onAnySave"],
-          "enumDescriptions": [
-            "Only scan when the file is explicitly saved (Ctrl+S / Cmd+S). Prevents false triggers during Copilot inline diff previews that auto-save before the user accepts changes.",
-            "Scan on any save event including auto-save. Use this if you rely on auto-save and never manually save files."
-          ],
-          "description": "Controls when the auto-scan triggers on file save."
         }
       }
     }
