@@ -407,6 +407,7 @@ let issueStore: any[] = [];                                        // canonical 
 let fileHashCache: Map<string, string> = new Map();               // relPath → hash at last completed per-file scan
 let pendingScanHash: Map<string, string> = new Map();             // relPath → hash of in-flight per-file scan
 let activeScanControllers: Map<string, AbortController> = new Map(); // relPath → abort controller for in-flight scan
+let changeDebounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map(); // relPath → pending change-event debounce
 
 const DIAGNOSTICS_STORAGE_KEY = 'aoys.diagnostics.v1';
 
@@ -453,40 +454,60 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  // Auto-scan on save: fire immediately on every save, gated by content hash.
-  // Scanning is per-file and independent of the global scan lock; any in-flight
-  // scan for the same file is aborted first so stale-content results are never applied.
+  // Shared trigger: hash-gate + cancel stale scans + start per-file scan.
+  // Save handler calls this immediately; change handler calls it after debounce.
+  // Cancels any pending change debounce so a save always takes priority.
+  const queuePerFileScan = (doc: vscode.TextDocument, relPath: string, workspaceRoot: string) => {
+    // A save always wins — cancel the pending change debounce for this file.
+    const changeTimer = changeDebounceTimers.get(relPath);
+    if (changeTimer) { clearTimeout(changeTimer); changeDebounceTimers.delete(relPath); }
+
+    const hash = hashContent(doc.getText());
+    if (fileHashCache.get(relPath) === hash) { return; }     // already scanned this content
+    if (pendingScanHash.get(relPath) === hash) { return; }   // already scanning this content
+
+    // Cancel any in-flight scan for this file (content has changed).
+    activeScanControllers.get(relPath)?.abort();
+    activeScanControllers.delete(relPath);
+
+    // If a global manual scan is running, don't start a conflicting per-file scan.
+    if (scanInProgress) { fileHashCache.delete(relPath); pendingScanHash.delete(relPath); return; }
+
+    pendingScanHash.set(relPath, hash);
+    const controller = new AbortController();
+    activeScanControllers.set(relPath, controller);
+    runPerFileScan(relPath, hash, controller, workspaceRoot);
+  };
+
+  // Trigger immediately on every save (file content is already on disk; git diff is valid).
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument(doc => {
       const folder = vscode.workspace.getWorkspaceFolder(doc.uri);
       if (!folder) { return; }
-      const root = folder.uri.fsPath;
-      const relPath = path.relative(root, doc.uri.fsPath).replace(/\\/g, '/');
+      const relPath = path.relative(folder.uri.fsPath, doc.uri.fsPath).replace(/\\/g, '/');
+      if (BINARY_EXT_RE.test(relPath) || ALWAYS_SKIP_BASENAMES.has(path.basename(relPath))) { return; }
+      queuePerFileScan(doc, relPath, folder.uri.fsPath);
+    })
+  );
+
+  // Trigger on document changes (e.g. Copilot quick-fix → "Keep") with a per-file debounce
+  // so the scan fires even when the file is never explicitly saved.
+  // The save handler above clears this timer if the user saves first, preventing double scans.
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeTextDocument(event => {
+      if (event.contentChanges.length === 0) { return; }       // metadata-only event
+      const doc = event.document;
+      const folder = vscode.workspace.getWorkspaceFolder(doc.uri);
+      if (!folder) { return; }
+      const relPath = path.relative(folder.uri.fsPath, doc.uri.fsPath).replace(/\\/g, '/');
       if (BINARY_EXT_RE.test(relPath) || ALWAYS_SKIP_BASENAMES.has(path.basename(relPath))) { return; }
 
-      const hash = hashContent(doc.getText());
-
-      // Already scanned this exact content — nothing to do.
-      if (fileHashCache.get(relPath) === hash) { return; }
-      // Already have this content queued or in-flight — don't duplicate.
-      if (pendingScanHash.get(relPath) === hash) { return; }
-
-      // Cancel any in-flight scan for this file (content has changed).
-      activeScanControllers.get(relPath)?.abort();
-      activeScanControllers.delete(relPath);
-
-      // If a global manual scan is running, don't start a conflicting per-file scan.
-      // Invalidate the cache so the manual scan's completed result is not shadowed.
-      if (scanInProgress) {
-        fileHashCache.delete(relPath);
-        pendingScanHash.delete(relPath);
-        return;
-      }
-
-      pendingScanHash.set(relPath, hash);
-      const controller = new AbortController();
-      activeScanControllers.set(relPath, controller);
-      runPerFileScan(relPath, hash, controller, root);
+      const existing = changeDebounceTimers.get(relPath);
+      if (existing) { clearTimeout(existing); }
+      changeDebounceTimers.set(relPath, setTimeout(() => {
+        changeDebounceTimers.delete(relPath);
+        queuePerFileScan(doc, relPath, folder.uri.fsPath);
+      }, 5000));
     })
   );
 
@@ -670,13 +691,20 @@ async function runPerFileScan(relPath: string, expectedHash: string, controller:
 
   const content = document.getText();
   try {
-    const git = simpleGit(workspaceRoot);
-    const diff = await git.diff([relPath]).catch(() => '');
+    // For dirty (unsaved) files, git diff only reflects on-disk content — it misses in-memory
+    // changes. Use a full-file scan in that case so the LLM sees the actual current content.
+    let userPrompt: string;
+    if (document.isDirty) {
+      userPrompt = buildFullScanPrompt(relPath, content, language, rules);
+    } else {
+      const git = simpleGit(workspaceRoot);
+      const diff = await git.diff([relPath]).catch(() => '');
+      userPrompt = buildDiffScanPrompt(relPath, content, diff, language, rules);
+    }
     if (controller.signal.aborted) { cleanup(false); return; }
 
     const issues = await auditFile(
-      config, relPath,
-      buildDiffScanPrompt(relPath, content, diff, language, rules),
+      config, relPath, userPrompt,
       undefined, undefined, relPath,
       controller.signal
     );
@@ -1149,4 +1177,6 @@ export function deactivate() {
   for (const ctrl of activeScanControllers.values()) { ctrl.abort(); }
   activeScanControllers.clear();
   pendingScanHash.clear();
+  for (const timer of changeDebounceTimers.values()) { clearTimeout(timer); }
+  changeDebounceTimers.clear();
 }
