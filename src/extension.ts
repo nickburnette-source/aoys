@@ -452,6 +452,19 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
+  // Track which documents are being manually saved so we can gate the auto-scan.
+  // Maps uri → timestamp so stale entries (from saves that failed before onDidSave fired)
+  // are ignored; entries are always deleted in onDidSave regardless of workspace membership.
+  const manualSaveUris = new Map<string, number>();
+  const MANUAL_SAVE_TTL_MS = 5000;
+  context.subscriptions.push(
+    vscode.workspace.onWillSaveTextDocument(event => {
+      if (event.reason === vscode.TextDocumentSaveReason.Manual) {
+        manualSaveUris.set(event.document.uri.toString(), Date.now());
+      }
+    })
+  );
+
   // Auto-scan on save: accumulate saved files, debounce 3s, then run incremental scan.
   // Uses a named function so the timer can reschedule itself if a scan is already running.
   const triggerSaveScan = () => {
@@ -469,9 +482,23 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument(doc => {
+      const uriKey = doc.uri.toString();
+      const autoScanMode = vscode.workspace.getConfiguration('aoys').get<string>('autoScanOnSave') ?? 'onManualSave';
+
+      // Always delete to prevent leaks (non-workspace files, failed saves that re-saved later, etc.).
+      const savedAt = manualSaveUris.get(uriKey);
+      manualSaveUris.delete(uriKey);
+
+      // Gate by save reason unless the user has opted into scanning on any save.
+      if (autoScanMode === 'onManualSave') {
+        // Reject if not a manual save, or if the marker is stale (save previously failed).
+        if (savedAt === undefined || Date.now() - savedAt > MANUAL_SAVE_TTL_MS) { return; }
+      }
+
       // Use getWorkspaceFolder for safe membership check (avoids path-prefix false-positives).
       const folder = vscode.workspace.getWorkspaceFolder(doc.uri);
       if (!folder) { return; }
+
       const root = folder.uri.fsPath;
       const relPath = path.relative(root, doc.uri.fsPath).replace(/\\/g, '/');
       // Only cheap synchronous checks here — .aoysignore filtering happens inside scanChangedFiles.
