@@ -558,10 +558,15 @@ export function activate(context: vscode.ExtensionContext) {
 
       const existing = changeDebounceTimers.get(relPath);
       if (existing) { clearTimeout(existing); }
+      // Use a shorter debounce for large batch edits (e.g. Copilot quick-fix applying many
+      // lines at once) vs. individual keystrokes (where we want to let the user finish typing).
+      const totalChanged = event.contentChanges.reduce((s, c) => s + c.text.length + c.rangeLength, 0);
+      const debounceMs = totalChanged > 50 ? 500 : 3000;
       changeDebounceTimers.set(relPath, setTimeout(() => {
         changeDebounceTimers.delete(relPath);
+        outputChannel.appendLine(`\nAOYS · queuing auto-scan: ${relPath}`);
         queuePerFileScan(doc, relPath, folder.uri.fsPath);
-      }, 5000));
+      }, debounceMs));
     })
   );
 
@@ -808,6 +813,20 @@ async function scanChangedFiles(specificFiles?: string[]): Promise<void> {
   const aoysIgnorePatterns = loadAoysIgnorePatterns(workspaceRoot);
   const preFilterCount = files.length;
   files = files.filter(f => !shouldSkipFile(f, aoysIgnorePatterns));
+
+  // Hash-gate: skip files whose content hasn't changed since the last AOYS scan.
+  // This prevents re-scanning git-modified files that were already scanned at their current content.
+  if (fileHashCache.size > 0) {
+    const hashChecked = await Promise.all(files.map(async f => {
+      const cached = fileHashCache.get(f);
+      if (!cached) { return f; }
+      try {
+        const doc = await vscode.workspace.openTextDocument(path.join(workspaceRoot, f));
+        return hashContent(doc.getText()) !== cached ? f : null;
+      } catch { return f; }
+    }));
+    files = hashChecked.filter((f): f is string => f !== null);
+  }
 
   if (files.length === 0) {
     vscode.window.showInformationMessage('AOYS: No changed files to scan');
