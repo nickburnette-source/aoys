@@ -43,7 +43,7 @@ All scanning runs against your local [Ollama](https://ollama.com) instance. Noth
 | **Full Project Scan** | `AOYS: Full Project Scan` | Initial scan, branch switch, or periodic audit |
 
 ### 🔄 Parallel Scanning
-Files are scanned concurrently (default: 3 workers, configurable up to 10). A bounded worker pool keeps your Ollama instance from being overwhelmed. Each file's output is prefixed `[N/M]` so concurrent results stay traceable.
+Files are scanned concurrently if configured to (default: 1 workers, configurable up to 10). A bounded worker pool keeps your Ollama instance from being overwhelmed. Each file's output is prefixed `[N/M]` so concurrent results stay traceable.
 
 ### 💾 Content-Hash Cache
 Full scans skip the LLM for files that haven't changed since the last scan. Cache is stored in `.aoys/scan-cache.json` and keyed by content hash — file renames and moves still invalidate correctly.
@@ -203,6 +203,11 @@ AOYS is **private by design**:
 6. **Results** — issues applied to VS Code diagnostics, SARIF report written to `.aoys/`
 
 ---
+
+## Support Development
+
+☕ **Buy me a cup of coffee** -> https://buymeacoffee.com/nily
+
 
 ## License
 
