@@ -1,0 +1,71 @@
+{
+  "name": "aoys",
+  "displayName": "AOYS",
+  "description": "Local model powered intelligent code auditor — security + quality + auto-fix (fully local)",
+  "version": "0.1.0",
+  "publisher": "nily",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["*"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aoys.scanChanged",
+        "title": "AOYS: Scan Changed Files"
+      },
+      {
+        "command": "aoys.scanFullProject",
+        "title": "AOYS: Full Project Scan"
+      },
+      {
+        "command": "aoys.selectModel",
+        "title": "AOYS: Select Model"
+      },
+      {
+        "command": "aoys.showOutput",
+        "title": "AOYS: Show Output"
+      }
+    ],
+    "configuration": {
+      "title": "AOYS",
+      "properties": {
+        "aoys.baseUrl": {
+          "type": "string",
+          "default": "http://192.168.1.234:11434/v1",
+          "description": "OpenAI-compatible endpoint (default = local Ollama)"
+        },
+        "aoys.model": {
+          "type": "string",
+          "default": "auto",
+          "description": "Model name to use, or \"auto\" to automatically select the best available Gemma model from your Ollama instance. To use a specific model, set this to its full name (e.g. gemma4:31b). Run: ollama pull gemma4"
+        },
+        "aoys.temperature": {
+          "type": "number",
+          "default": 0.1,
+          "description": "Temperature (keep low for perfect JSON)"
+        },
+        "aoys.scanConcurrency": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Number of files to scan concurrently during a full or changed-file scan."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "simple-git": "^3.24.0"
+  }
+}
