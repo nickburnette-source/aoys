@@ -68,7 +68,7 @@ function buildDiffScanPrompt(file: string, content: string, diff: string, langua
 const BINARY_EXT_RE = /\.(png|jpe?g|gif|ico|webp|bmp|tiff?|mp4|m4v|avi|mov|wmv|webm|mp3|m4a|wav|flac|aac|ogg|wma|zip|tar|gz|bz2|xz|7z|rar|pdf|docx?|xlsx?|pptx?|pyc|class|o|a|so|dll|exe|bin|wasm|db|sqlite3?|jar|war|ear|dmg|pkg|deb|rpm|apk|ipa|xcarchive|ttf|otf|woff2?|eot)$/i;
 
 // Repository control files — never code, nothing to scan.
-const ALWAYS_SKIP_BASENAMES: ReadonlySet<string> = new Set(['.gitignore']);
+const ALWAYS_SKIP_BASENAMES: ReadonlySet<string> = new Set(['.gitignore', '.DS_Store']);
 
 // ---------------------------------------------------------------------------
 // Language detection & Semgrep rules
