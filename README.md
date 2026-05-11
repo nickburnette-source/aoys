@@ -8,6 +8,12 @@
 
 ---
 
+## Support Development
+
+☕ **Buy me a coffee** → https://buymeacoffee.com/nily
+
+---
+
 ## What It Does
 
 AOYS runs your code through a local LLM (Gemma 4 by default) with an **attacker's mindset**. It doesn't just run pattern matching — it reasons about your code the way a red-teamer would, catching design-level vulnerabilities that static rules cannot.
@@ -203,11 +209,6 @@ AOYS is **private by design**:
 6. **Results** — issues applied to VS Code diagnostics, SARIF report written to `.aoys/`
 
 ---
-
-## Support Development
-
-☕ **Buy me a cup of coffee** -> https://buymeacoffee.com/nily
-
 
 ## License
 

@@ -2,7 +2,7 @@
   "name": "aoys",
   "displayName": "AOYS",
   "description": "Local model powered intelligent code auditor — security + quality + auto-fix (fully local)",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "nily",
   "icon": "assets/icon.png",
   "repository": {
