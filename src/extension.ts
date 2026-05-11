@@ -402,9 +402,14 @@ let diagnosticCollection: vscode.DiagnosticCollection;
 let outputChannel: vscode.OutputChannel;
 let scanInProgress = false;
 let modelCache: { baseUrl: string; model: string } | null = null;
+let extensionContext: vscode.ExtensionContext | undefined;
+let issueStore: any[] = [];                          // canonical set of all current issues (all files)
+
+const DIAGNOSTICS_STORAGE_KEY = 'aoys.diagnostics.v1';
 
 export function activate(context: vscode.ExtensionContext) {
   console.log('✅ AOYS activated');
+  extensionContext = context;
 
   diagnosticCollection = vscode.languages.createDiagnosticCollection('aoys');
   context.subscriptions.push(diagnosticCollection);
@@ -430,6 +435,20 @@ export function activate(context: vscode.ExtensionContext) {
   statusBar.tooltip = tooltip;
   statusBar.show();
   context.subscriptions.push(statusBar);
+
+  // Restore diagnostics from the previous session
+  const workspaceRoot = getWorkspaceRoot();
+  if (workspaceRoot) {
+    const saved = context.workspaceState.get<unknown>(DIAGNOSTICS_STORAGE_KEY);
+    if (Array.isArray(saved) && saved.length > 0) {
+      issueStore = filterWorkspacePaths(saved, workspaceRoot);
+      const diagnosticsMap = new Map<string, vscode.Diagnostic[]>();
+      for (const issue of issueStore) { buildDiagEntry(issue, workspaceRoot, diagnosticsMap); }
+      for (const [absFile, diags] of diagnosticsMap) {
+        diagnosticCollection.set(vscode.Uri.file(absFile), diags);
+      }
+    }
+  }
 
   if (!context.globalState.get('initialScanPrompted')) {
     context.globalState.update('initialScanPrompted', true);
@@ -947,45 +966,66 @@ function safePos(line: unknown, col: unknown): vscode.Position {
   return new vscode.Position(l, c);
 }
 
+// Filters out issues with missing or out-of-workspace file paths (LLM output is untrusted).
+function filterWorkspacePaths(issues: any[], workspaceRoot: string): any[] {
+  return issues.filter(issue => {
+    if (!issue.file || typeof issue.file !== 'string') { return false; }
+    const absFile = path.resolve(workspaceRoot, issue.file);
+    return absFile.startsWith(workspaceRoot + path.sep) || absFile === workspaceRoot;
+  });
+}
+
+// Builds a single vscode.Diagnostic from a raw issue and adds it to the map.
+function buildDiagEntry(issue: any, workspaceRoot: string, map: Map<string, vscode.Diagnostic[]>): void {
+  if (!issue.file || typeof issue.file !== 'string') { return; }
+  const absFile = path.resolve(workspaceRoot, issue.file);
+  if (!absFile.startsWith(workspaceRoot + path.sep) && absFile !== workspaceRoot) { return; }
+  if (!map.has(absFile)) { map.set(absFile, []); }
+  const start = safePos(issue.startLine, issue.startColumn);
+  const end = safePos(issue.endLine ?? issue.startLine, 0);
+  const range = new vscode.Range(start, new vscode.Position(end.line, 1000));
+  const diag = new vscode.Diagnostic(
+    range,
+    `${issue.message} — ${issue.description}`,
+    issue.severity === 'error' ? vscode.DiagnosticSeverity.Error :
+    issue.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Information
+  );
+  diag.code = issue.ruleId;
+  diag.source = 'AOYS';
+  map.get(absFile)!.push(diag);
+}
+
 function applyDiagnostics(issues: any[], workspaceRoot: string, scannedFiles?: string[]): void {
+  const safeIssues = filterWorkspacePaths(issues, workspaceRoot);
+
   if (scannedFiles) {
-    // Partial update: only wipe diagnostics for files that were actually re-scanned.
-    // All other files keep their existing diagnostics.
-    for (const relFile of scannedFiles) {
-      const absFile = path.resolve(workspaceRoot, relFile);
-      diagnosticCollection.set(vscode.Uri.file(absFile), []);
+    // Incremental update: replace issueStore entries only for scanned files.
+    const scannedAbsPaths = new Set(scannedFiles.map(f => path.resolve(workspaceRoot, f)));
+    issueStore = issueStore.filter(issue => {
+      if (!issue.file || typeof issue.file !== 'string') { return false; }
+      return !scannedAbsPaths.has(path.resolve(workspaceRoot, issue.file));
+    });
+    issueStore.push(...safeIssues);
+
+    // Rebuild diagnostics only for scanned files (unscanned files keep existing diagnostics).
+    const diagnosticsMap = new Map<string, vscode.Diagnostic[]>();
+    for (const absPath of scannedAbsPaths) { diagnosticsMap.set(absPath, []); }
+    for (const issue of safeIssues) { buildDiagEntry(issue, workspaceRoot, diagnosticsMap); }
+    for (const [absFile, diags] of diagnosticsMap) {
+      diagnosticCollection.set(vscode.Uri.file(absFile), diags);
     }
   } else {
+    // Full scan: replace everything.
+    issueStore = safeIssues;
     diagnosticCollection.clear();
-  }
-  const diagnosticsMap = new Map<string, vscode.Diagnostic[]>();
-
-  for (const issue of issues) {
-    if (!issue.file || typeof issue.file !== 'string') { continue; }
-
-    const absFile = path.resolve(workspaceRoot, issue.file);
-    // Reject any path that escapes the workspace root — LLM output is untrusted.
-    if (!absFile.startsWith(workspaceRoot + path.sep) && absFile !== workspaceRoot) { continue; }
-    if (!diagnosticsMap.has(absFile)) { diagnosticsMap.set(absFile, []); }
-
-    const start = safePos(issue.startLine, issue.startColumn);
-    const end = safePos(issue.endLine ?? issue.startLine, 0);
-    const range = new vscode.Range(start, new vscode.Position(end.line, 1000));
-
-    const diag = new vscode.Diagnostic(
-      range,
-      `${issue.message} — ${issue.description}`,
-      issue.severity === 'error' ? vscode.DiagnosticSeverity.Error :
-      issue.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Information
-    );
-    diag.code = issue.ruleId;
-    diag.source = 'AOYS';
-    diagnosticsMap.get(absFile)!.push(diag);
+    const diagnosticsMap = new Map<string, vscode.Diagnostic[]>();
+    for (const issue of safeIssues) { buildDiagEntry(issue, workspaceRoot, diagnosticsMap); }
+    for (const [absFile, diags] of diagnosticsMap) {
+      diagnosticCollection.set(vscode.Uri.file(absFile), diags);
+    }
   }
 
-  for (const [absFile, diags] of diagnosticsMap) {
-    diagnosticCollection.set(vscode.Uri.file(absFile), diags);
-  }
+  extensionContext?.workspaceState.update(DIAGNOSTICS_STORAGE_KEY, issueStore);
 }
 
 export function deactivate() {}
