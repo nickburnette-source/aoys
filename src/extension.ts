@@ -321,6 +321,7 @@ function loadAoysIgnorePatterns(workspaceRoot: string): string[] {
 function shouldSkipFile(relPath: string, aoysIgnorePatterns: string[]): boolean {
   if (ALWAYS_SKIP_BASENAMES.has(path.basename(relPath))) { return true; }
   const normalPath = relPath.replace(/\\/g, '/');
+  if (normalPath.startsWith('.aoys/')) { return true; } // always skip internal extension dir
   return aoysIgnorePatterns.some(p => gitignorePatternMatches(normalPath, p));
 }
 
@@ -335,27 +336,50 @@ function gitignorePatternMatches(normalPath: string, pattern: string): boolean {
   if (dirOnly) { pat = pat.slice(0, -1); }
   if (!pat) { return false; }
 
-  const regexStr = pat
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&') // escape regex specials (not * or ?)
-    .replace(/\*\*\//g, '(?:[^/]+/)*')     // **/ → zero-or-more path segments
-    .replace(/\*\*/g, '.*')                // ** → anything
-    .replace(/\*/g, '[^/]*')              // * → within one segment
-    .replace(/\?/g, '[^/]');             // ? → single char within segment
+  // Build regexStr in a single character-by-character pass.
+  // Chained .replace() calls corrupt each other: the * quantifier in previously
+  // inserted (?:[^/]+/)* gets hit by the later * → [^/]* replacement, breaking
+  // all ** patterns. One-pass parsing is the correct fix.
+  let regexStr = '';
+  let i = 0;
+  while (i < pat.length) {
+    const ch = pat[i];
+    if (ch === '*') {
+      if (pat[i + 1] === '*') {
+        if (pat[i + 2] === '/') {
+          regexStr += '(?:[^/]+/)*'; // **/ → zero-or-more path segments
+          i += 3;
+        } else {
+          regexStr += '.*';          // ** → anything
+          i += 2;
+        }
+      } else {
+        regexStr += '[^/]*';         // * → within-segment wildcard
+        i += 1;
+      }
+    } else if (ch === '?') {
+      regexStr += '[^/]';
+      i += 1;
+    } else if (/[.+^${}()|[\]\\]/.test(ch)) {
+      regexStr += '\\' + ch;        // escape regex specials
+      i += 1;
+    } else {
+      regexStr += ch;
+      i += 1;
+    }
+  }
 
   try {
     if (dirOnly) {
-      // Must match a directory component (followed by /)
       const anchor = rooted || pat.includes('/') ? '^' : '(?:^|/)';
       return new RegExp(`${anchor}${regexStr}/`).test(normalPath);
     } else if (rooted || pat.includes('/')) {
-      // Anchored to workspace root
       return new RegExp(`^${regexStr}$`).test(normalPath);
     } else {
-      // Unanchored — match basename or any trailing segment
       return new RegExp(`(?:^|/)${regexStr}$`).test(normalPath);
     }
   } catch {
-    return false; // invalid pattern in .aoysignore — skip it silently
+    return false; // invalid pattern in .aoysignore — skip silently
   }
 }
 
@@ -607,37 +631,34 @@ async function scanChangedFiles(): Promise<void> {
         const prefix = `${i + 1}/${files.length}`;
         const language = detectLanguage(file);
         const rules = rulesCache.get(language) ?? [];
-        progress.report({ message: `${prefix}: ${file} — thinking…` });
+
+        // Print header immediately so the output shows which files are in-flight.
+        outputChannel.appendLine(`\n[${prefix}] ${file} (${language}${rules.length > 0 ? `, ${rules.length} rules` : ''})`);
 
         const t0 = Date.now();
-        const elapsedTimer = setInterval(() => {
-          const secs = ((Date.now() - t0) / 1000).toFixed(0);
-          progress.report({ message: `${prefix}: ${file} — scanning… ${secs}s` });
-        }, 1000);
-        // Collect per-file log lines so concurrent blocks don't interleave.
-        const logLines: string[] = [`\n[${prefix}] ${file} (${language}${rules.length > 0 ? `, ${rules.length} rules` : ''})`];
+        let thoughtAccum = '';
+        let lastThoughtTs = 0;
         try {
           const document = await vscode.workspace.openTextDocument(path.join(workspaceRoot, file));
           const diff = await git.diff([file]);
-          let lastThought = '';
-          const issues = await auditFile(config, file, buildDiffScanPrompt(file, document.getText(), diff, language, rules), token, (thought) => {
-            lastThought = thought;
-            const snippet = thought.replace(/\n/g, ' ').trim().slice(0, 70);
-            if (snippet) { progress.report({ message: `${prefix}: ${file} — 💭 ${snippet}` }); }
-          });
-          clearInterval(elapsedTimer);
+          const issues = await auditFile(config, file, buildDiffScanPrompt(file, document.getText(), diff, language, rules), token, (delta) => {
+            // Accumulate raw SSE deltas; emit at most every 3s to avoid flooding.
+            thoughtAccum += delta;
+            const now = Date.now();
+            if (now - lastThoughtTs >= 3000) {
+              lastThoughtTs = now;
+              const snippet = thoughtAccum.replace(/\n/g, ' ').trim().slice(0, 100);
+              if (snippet) { outputChannel.appendLine(`[${prefix}]     💭 ${snippet}`); }
+            }
+          }, prefix);
           allIssues.push(...issues);
           const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-          if (lastThought) { logLines.push(`    💭 ${lastThought.replace(/\n/g, ' ').trim().slice(0, 100)}`); }
-          logLines.push(`    ✓ ${issues.length} issue(s) · ${elapsed}s`);
-          issues.forEach(iss => logLines.push(`      [${iss.severity}] ${iss.message} (line ${iss.startLine})`));
-          outputChannel.appendLine(logLines.join('\n'));
-          progress.report({ message: `${prefix}: ${file} — done`, increment: 100 / files.length });
+          outputChannel.appendLine(`[${prefix}]     ✓ ${issues.length} issue(s) · ${elapsed}s`);
+          issues.forEach(iss => outputChannel.appendLine(`[${prefix}]       [${iss.severity}] ${iss.message} (line ${iss.startLine})`));
+          progress.report({ increment: 100 / files.length });
         } catch (err: any) {
-          clearInterval(elapsedTimer);
           const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-          logLines.push(`    ✗ skipped: ${err.message} (${elapsed}s)`);
-          outputChannel.appendLine(logLines.join('\n'));
+          outputChannel.appendLine(`[${prefix}]     ✗ skipped: ${err.message} (${elapsed}s)`);
           console.error(`AOYS: Error processing ${file}:`, err);
           vscode.window.showWarningMessage(`AOYS: Skipped ${file}: ${err.message}`);
           progress.report({ increment: 100 / files.length });
@@ -728,14 +749,15 @@ async function scanFullProject(): Promise<void> {
         const prefix = `${i + 1}/${relFiles.length}`;
         const language = detectLanguage(uri.fsPath);
         const rules = rulesCache.get(language) ?? [];
-        progress.report({ message: `${prefix}: ${relFile} — thinking…` });
+        // Print header immediately so the output shows which files are in-flight.
+        outputChannel.appendLine(`\n[${prefix}] ${relFile} (${language}${rules.length > 0 ? `, ${rules.length} rules` : ''})`);
 
         // Check cache before opening the file — fast path for unchanged files.
         let document: vscode.TextDocument;
         try {
           document = await vscode.workspace.openTextDocument(uri);
         } catch (err: any) {
-          outputChannel.appendLine(`\n[${prefix}] ${relFile}\n    ✗ skipped: ${err.message}`);
+          outputChannel.appendLine(`[${prefix}]     ✗ skipped: ${err.message}`);
           progress.report({ increment: 100 / relFiles.length });
           return;
         }
@@ -745,41 +767,34 @@ async function scanFullProject(): Promise<void> {
         const cached = scanCache[relFile];
         if (cached && cached.hash === hash) {
           allIssues.push(...cached.issues);
-          outputChannel.appendLine(`\n[${prefix}] ${relFile} (${language}) — [cached] ${cached.issues.length} issue(s)`);
-          progress.report({ message: `${prefix}: ${relFile} — cached`, increment: 100 / relFiles.length });
+          outputChannel.appendLine(`[${prefix}]     [cached] ${cached.issues.length} issue(s)`);
+          progress.report({ increment: 100 / relFiles.length });
           return;
         }
 
         const t0 = Date.now();
-        // Tick the progress notification every second so the user sees a live
-        // heartbeat regardless of model type (most models don't emit thinking tokens).
-        const elapsedTimer = setInterval(() => {
-          const secs = ((Date.now() - t0) / 1000).toFixed(0);
-          progress.report({ message: `${prefix}: ${relFile} — scanning… ${secs}s` });
-        }, 1000);
-        // Collect per-file log lines so concurrent blocks don't interleave.
-        const logLines: string[] = [`\n[${prefix}] ${relFile} (${language}${rules.length > 0 ? `, ${rules.length} rules` : ''})`];
+        let thoughtAccum = '';
+        let lastThoughtTs = 0;
         try {
-          let lastThought = '';
-          const issues = await auditFile(config, relFile, buildFullScanPrompt(relFile, content, language, rules), token, (thought) => {
-            lastThought = thought;
-            const snippet = thought.replace(/\n/g, ' ').trim().slice(0, 70);
-            if (snippet) { progress.report({ message: `${prefix}: ${relFile} — 💭 ${snippet}` }); }
-          });
-          clearInterval(elapsedTimer);
+          const issues = await auditFile(config, relFile, buildFullScanPrompt(relFile, content, language, rules), token, (delta) => {
+            // Accumulate raw SSE deltas; emit at most every 3s to avoid flooding.
+            thoughtAccum += delta;
+            const now = Date.now();
+            if (now - lastThoughtTs >= 3000) {
+              lastThoughtTs = now;
+              const snippet = thoughtAccum.replace(/\n/g, ' ').trim().slice(0, 100);
+              if (snippet) { outputChannel.appendLine(`[${prefix}]     💭 ${snippet}`); }
+            }
+          }, prefix);
           allIssues.push(...issues);
           scanCache[relFile] = { hash, issues, ts: new Date().toISOString() };
           const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-          if (lastThought) { logLines.push(`    💭 ${lastThought.replace(/\n/g, ' ').trim().slice(0, 100)}`); }
-          logLines.push(`    ✓ ${issues.length} issue(s) · ${elapsed}s`);
-          issues.forEach(iss => logLines.push(`      [${iss.severity}] ${iss.message} (line ${iss.startLine})`));
-          outputChannel.appendLine(logLines.join('\n'));
-          progress.report({ message: `${prefix}: ${relFile} — done`, increment: 100 / relFiles.length });
+          outputChannel.appendLine(`[${prefix}]     ✓ ${issues.length} issue(s) · ${elapsed}s`);
+          issues.forEach(iss => outputChannel.appendLine(`[${prefix}]       [${iss.severity}] ${iss.message} (line ${iss.startLine})`));
+          progress.report({ increment: 100 / relFiles.length });
         } catch (err: any) {
-          clearInterval(elapsedTimer);
           const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-          logLines.push(`    ✗ skipped: ${err.message} (${elapsed}s)`);
-          outputChannel.appendLine(logLines.join('\n'));
+          outputChannel.appendLine(`[${prefix}]     ✗ skipped: ${err.message} (${elapsed}s)`);
           console.error(`AOYS: Error processing ${relFile}:`, err);
           vscode.window.showWarningMessage(`AOYS: Skipped ${relFile}: ${err.message}`);
           progress.report({ increment: 100 / relFiles.length });
@@ -798,7 +813,7 @@ async function scanFullProject(): Promise<void> {
   await saveScanCache(scanCache, workspaceRoot, relFiles);
 }
 
-async function auditFile(config: AuditConfig, _file: string, userPrompt: string, cancelToken?: vscode.CancellationToken, onThinking?: (text: string) => void): Promise<any[]> {
+async function auditFile(config: AuditConfig, _file: string, userPrompt: string, cancelToken?: vscode.CancellationToken, onThinking?: (text: string) => void, logPrefix?: string): Promise<any[]> {
   const controller = new AbortController();
   const cancelSub = cancelToken?.onCancellationRequested(() => controller.abort());
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -871,7 +886,7 @@ async function auditFile(config: AuditConfig, _file: string, userPrompt: string,
     try {
       parsed = JSON.parse(cleanContent || '{}');
     } catch {
-      outputChannel.appendLine(`    ⚠ Invalid JSON from model — raw: ${cleanContent.slice(0, 200)}`);
+      outputChannel.appendLine(`${logPrefix ? `[${logPrefix}] ` : ''}    ⚠ Invalid JSON from model — raw: ${cleanContent.slice(0, 200)}`);
       return [];
     }
     return Array.isArray(parsed.issues) ? sanitizeIssues(parsed.issues) : [];
@@ -880,7 +895,7 @@ async function auditFile(config: AuditConfig, _file: string, userPrompt: string,
     const msg = err.name === 'AbortError'
       ? 'cancelled by user'
       : cause ? `${err.message} (${cause})` : err.message;
-    outputChannel.appendLine(`    ✗ auditFile error: ${msg}`);
+    outputChannel.appendLine(`${logPrefix ? `[${logPrefix}] ` : ''}    ✗ auditFile error: ${msg}`);
     throw new Error(msg);
   } finally {
     try { await reader?.cancel(); } catch { /* cleanup */ }

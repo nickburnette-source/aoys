@@ -4,9 +4,15 @@
   "description": "Local model powered intelligent code auditor — security + quality + auto-fix (fully local)",
   "version": "0.1.0",
   "publisher": "nily",
+  "icon": "assets/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nickburnette-source/aoys"
+  },
   "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
-  "activationEvents": ["*"],
+  "categories": ["Linters"],
+  "keywords": ["security", "sast", "ollama", "gemma", "local", "ai", "vulnerability", "static analysis"],
+  "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -32,7 +38,7 @@
       "properties": {
         "aoys.baseUrl": {
           "type": "string",
-          "default": "http://192.168.1.234:11434/v1",
+          "default": "http://localhost:11434/v1",
           "description": "OpenAI-compatible endpoint (default = local Ollama)"
         },
         "aoys.model": {
@@ -47,7 +53,7 @@
         },
         "aoys.scanConcurrency": {
           "type": "number",
-          "default": 3,
+          "default": 1,
           "minimum": 1,
           "maximum": 10,
           "description": "Number of files to scan concurrently during a full or changed-file scan."
