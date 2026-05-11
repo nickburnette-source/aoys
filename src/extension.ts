@@ -404,6 +404,8 @@ let scanInProgress = false;
 let modelCache: { baseUrl: string; model: string } | null = null;
 let extensionContext: vscode.ExtensionContext | undefined;
 let issueStore: any[] = [];                          // canonical set of all current issues (all files)
+let pendingSaveFiles: Set<string> = new Set();       // files saved since last auto-scan debounce
+let saveDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 
 const DIAGNOSTICS_STORAGE_KEY = 'aoys.diagnostics.v1';
 
@@ -449,6 +451,37 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }
   }
+
+  // Auto-scan on save: accumulate saved files, debounce 3s, then run incremental scan.
+  // Uses a named function so the timer can reschedule itself if a scan is already running.
+  const triggerSaveScan = () => {
+    saveDebounceTimer = undefined;
+    if (pendingSaveFiles.size === 0) { return; }
+    if (scanInProgress) {
+      // A scan is running; check again in 10s rather than dropping the queued files.
+      saveDebounceTimer = setTimeout(triggerSaveScan, 10000);
+      return;
+    }
+    const filesToScan = [...pendingSaveFiles];
+    pendingSaveFiles.clear();
+    withScanLock(() => scanChangedFiles(filesToScan));
+  };
+
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument(doc => {
+      // Use getWorkspaceFolder for safe membership check (avoids path-prefix false-positives).
+      const folder = vscode.workspace.getWorkspaceFolder(doc.uri);
+      if (!folder) { return; }
+      const root = folder.uri.fsPath;
+      const relPath = path.relative(root, doc.uri.fsPath).replace(/\\/g, '/');
+      // Only cheap synchronous checks here — .aoysignore filtering happens inside scanChangedFiles.
+      if (BINARY_EXT_RE.test(relPath) || ALWAYS_SKIP_BASENAMES.has(path.basename(relPath))) { return; }
+
+      pendingSaveFiles.add(relPath);
+      if (saveDebounceTimer) { clearTimeout(saveDebounceTimer); }
+      saveDebounceTimer = setTimeout(triggerSaveScan, 3000);
+    })
+  );
 
   if (!context.globalState.get('initialScanPrompted')) {
     context.globalState.update('initialScanPrompted', true);
@@ -592,7 +625,7 @@ async function selectModel(): Promise<void> {
   vscode.window.showInformationMessage(`AOYS: Model set to "${picked.label}"`);
 }
 
-async function scanChangedFiles(): Promise<void> {
+async function scanChangedFiles(specificFiles?: string[]): Promise<void> {
   const workspaceRoot = getWorkspaceRoot();
   if (!workspaceRoot) {
     vscode.window.showErrorMessage('AOYS: No workspace folder open');
@@ -603,15 +636,21 @@ async function scanChangedFiles(): Promise<void> {
   if (!config) { return; }
 
   let files: string[];
-  try {
-    const git = simpleGit(workspaceRoot);
-    const status = await git.status();
-    const renamed = status.renamed.map(r => r.to);
-    files = [...new Set([...status.staged, ...status.modified, ...status.created, ...renamed])]
-      .filter(f => !BINARY_EXT_RE.test(f));
-  } catch (err: any) {
-    vscode.window.showErrorMessage(`AOYS: Failed to read git status: ${err.message}`);
-    return;
+  if (specificFiles) {
+    // Auto-scan path: specific files passed directly (from save events).
+    files = specificFiles.filter(f => !BINARY_EXT_RE.test(f));
+  } else {
+    // Manual scan path: query git status for changed files.
+    try {
+      const git = simpleGit(workspaceRoot);
+      const status = await git.status();
+      const renamed = status.renamed.map(r => r.to);
+      files = [...new Set([...status.staged, ...status.modified, ...status.created, ...renamed])]
+        .filter(f => !BINARY_EXT_RE.test(f));
+    } catch (err: any) {
+      vscode.window.showErrorMessage(`AOYS: Failed to read git status: ${err.message}`);
+      return;
+    }
   }
 
   const aoysIgnorePatterns = loadAoysIgnorePatterns(workspaceRoot);
@@ -1028,4 +1067,10 @@ function applyDiagnostics(issues: any[], workspaceRoot: string, scannedFiles?: s
   extensionContext?.workspaceState.update(DIAGNOSTICS_STORAGE_KEY, issueStore);
 }
 
-export function deactivate() {}
+export function deactivate() {
+  if (saveDebounceTimer) {
+    clearTimeout(saveDebounceTimer);
+    saveDebounceTimer = undefined;
+  }
+  pendingSaveFiles.clear();
+}
