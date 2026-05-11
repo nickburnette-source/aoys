@@ -57,6 +57,12 @@
           "minimum": 1,
           "maximum": 10,
           "description": "Number of files to scan concurrently during a full or changed-file scan."
+        },
+        "aoys.contextLength": {
+          "type": "number",
+          "default": 32768,
+          "minimum": 2048,
+          "description": "Ollama context window size in tokens (num_ctx). Higher values let the model read larger files in one pass but consume more GPU memory. 32768 (~32K) is a safe default; increase to 65536 or 131072 if your GPU has enough VRAM. Files that still exceed the budget are automatically split into overlapping chunks."
         }
       }
     }

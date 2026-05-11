@@ -44,21 +44,74 @@ Field rules:
 - fix: one sentence — the specific code change to remediate`;
 
 function buildFullScanPrompt(file: string, content: string, language: string, rules: SemgrepRule[]): string {
-  const truncated = content.length > 8000 ? content.slice(0, 8000) + '\n\n[...file truncated...]' : content;
   const rulesSection = formatRulesSection(language, rules);
   // XML tags instead of backtick fences — backticks in source would break markdown fences
   // and create a prompt injection vector. XML closing tags are stripped from content as a precaution.
-  const safeContent = truncated.replace(/<\/file_content>/gi, '');
+  const safeContent = content.replace(/<\/file_content>/gi, '');
   return `Scan this ${language} file for exploitable security issues. Apply the Semgrep rules below AND look beyond them — design decisions and insecure defaults that static rules cannot catch.${rulesSection}\nFile: ${file}\n<file_content>\n${safeContent}\n</file_content>`;
 }
 
-function buildDiffScanPrompt(file: string, content: string, diff: string, language: string, rules: SemgrepRule[]): string {
-  const truncated = content.length > 8000 ? content.slice(0, 8000) + '\n\n[...truncated...]' : content;
-  const truncatedDiff = diff.length > 4000 ? diff.slice(0, 4000) + '\n\n[...diff truncated...]' : diff;
+// Used when a file is too large for a single request — informs the LLM of the excerpt boundaries
+// so it outputs absolute line numbers rather than relative ones.
+function buildChunkScanPrompt(file: string, chunkText: string, startLine: number, endLine: number, totalLines: number, language: string, rules: SemgrepRule[]): string {
   const rulesSection = formatRulesSection(language, rules);
-  const safeContent = truncated.replace(/<\/file_content>/gi, '');
-  const safeDiff = (truncatedDiff || '(no diff available)').replace(/<\/diff>/gi, '');
-  return `Scan these ${language} changes for exploitable security issues introduced or exposed by this diff. Consider: what attack surface did this change open?${rulesSection}\nFile: ${file}\n\n<file_content>\n${safeContent}\n</file_content>\n\n<diff>\n${safeDiff}\n</diff>`;
+  const safeContent = chunkText.replace(/<\/file_content>/gi, '');
+  return `Scan this ${language} file excerpt for exploitable security issues. Apply the Semgrep rules below AND look beyond them.${rulesSection}\nFile: ${file} (lines ${startLine}–${endLine} of ${totalLines} total)\nIMPORTANT: All line numbers in your JSON output must be absolute file line numbers (${startLine}–${endLine}), not relative to this excerpt.\n<file_content>\n${safeContent}\n</file_content>`;
+}
+
+// contextLength = Ollama num_ctx; rulesSection already formatted.
+// Returns max characters of file content that can fit in one request.
+// Conservative: 4 chars ≈ 1 token for code; reserves 1200 tokens for system prompt, rules, template, and response.
+function calcContentMaxChars(contextLength: number, rulesSection: string): number {
+  const rulesTokens = Math.ceil(rulesSection.length / 4);
+  const availableTokens = contextLength - 1200 - rulesTokens;
+  // Safety floor: 200 chars. True minimum contextLength (2048) with worst-case rules still yields
+  // ~390 chars, so this floor is only hit if the setting is manually set dangerously low.
+  return Math.max(availableTokens * 4, 200);
+}
+
+interface ContentChunk { text: string; startLine: number; endLine: number; }
+
+// Split content into line-aligned chunks each fitting within maxChars.
+// Overlaps the last OVERLAP lines of each chunk into the next so boundary-crossing issues aren't missed.
+function chunkLines(content: string, maxChars: number): ContentChunk[] {
+  const OVERLAP = 40;
+  const lines = content.split('\n');
+  if (content.length <= maxChars) { return [{ text: content, startLine: 1, endLine: lines.length }]; }
+  const chunks: ContentChunk[] = [];
+  let start = 0;
+  while (start < lines.length) {
+    let chars = 0; let end = start;
+    while (end < lines.length && chars + lines[end].length + 1 <= maxChars) { chars += lines[end].length + 1; end++; }
+    if (end === start) {
+      // Single line exceeds maxChars — truncate it so the chunk stays within budget and the loop advances.
+      chunks.push({ text: lines[start].slice(0, maxChars) + '\n/* ...line truncated — exceeds context budget */', startLine: start + 1, endLine: start + 1 });
+      start++;
+      if (start >= lines.length) { break; }
+      continue;
+    }
+    chunks.push({ text: lines.slice(start, end).join('\n'), startLine: start + 1, endLine: end });
+    if (end >= lines.length) { break; }
+    start = Math.max(start + 1, end - OVERLAP);
+  }
+  return chunks;
+}
+
+// contextLength in second param because diff-scan content budget depends on both the context window
+// and how large the diff itself is (diff gets priority; file content fills what remains).
+function buildDiffScanPrompt(file: string, content: string, diff: string, language: string, rules: SemgrepRule[], contextLength: number): string {
+  const rulesSection = formatRulesSection(language, rules);
+  const maxChars = calcContentMaxChars(contextLength, rulesSection);
+  const effectiveDiff = (diff || '(no diff available)').replace(/<\/diff>/gi, '');
+  // Diff is primary content — never truncate it. File content is context; fit what remains.
+  // If the diff alone already fills the budget, don't add file content on top.
+  const contentBudget = effectiveDiff.length >= maxChars
+    ? 0
+    : Math.max(maxChars - effectiveDiff.length, Math.floor(maxChars * 0.2));
+  const safeContent = content.length > contentBudget
+    ? content.slice(0, contentBudget).replace(/<\/file_content>/gi, '') + '\n\n[...file content exceeds context budget; diff reflects all actual changes...]'
+    : content.replace(/<\/file_content>/gi, '');
+  return `Scan these ${language} changes for exploitable security issues introduced or exposed by this diff. Consider: what attack surface did this change open?${rulesSection}\nFile: ${file}\n\n<file_content>\n${safeContent}\n</file_content>\n\n<diff>\n${effectiveDiff}\n</diff>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +440,7 @@ interface AuditConfig {
   baseUrl: string;
   model: string;
   temperature: number;
+  contextLength: number;
 }
 
 interface SSEChunk {
@@ -555,7 +609,8 @@ async function getConfig(): Promise<AuditConfig | null> {
   const model = await resolveModel(resolvedBaseUrl, configuredModel);
   if (!model) { return null; }
 
-  return { baseUrl: resolvedBaseUrl, model, temperature };
+  const contextLength = config.get<number>('contextLength') ?? 32768;
+  return { baseUrl: resolvedBaseUrl, model, temperature, contextLength };
 }
 
 async function resolveModel(baseUrl: string, configured: string): Promise<string | null> {
@@ -693,21 +748,16 @@ async function runPerFileScan(relPath: string, expectedHash: string, controller:
   try {
     // For dirty (unsaved) files, git diff only reflects on-disk content — it misses in-memory
     // changes. Use a full-file scan in that case so the LLM sees the actual current content.
-    let userPrompt: string;
+    if (controller.signal.aborted) { cleanup(false); return; }
+    let issues: any[];
     if (document.isDirty) {
-      userPrompt = buildFullScanPrompt(relPath, content, language, rules);
+      issues = await scanFileContent(config, relPath, content, language, rules, undefined, undefined, relPath, controller.signal);
     } else {
       const git = simpleGit(workspaceRoot);
       const diff = await git.diff([relPath]).catch(() => '');
-      userPrompt = buildDiffScanPrompt(relPath, content, diff, language, rules);
+      const prompt = buildDiffScanPrompt(relPath, content, diff, language, rules, config.contextLength);
+      issues = await auditFile(config, relPath, prompt, undefined, undefined, relPath, controller.signal);
     }
-    if (controller.signal.aborted) { cleanup(false); return; }
-
-    const issues = await auditFile(
-      config, relPath, userPrompt,
-      undefined, undefined, relPath,
-      controller.signal
-    );
 
     if (controller.signal.aborted) { cleanup(false); return; }
     // If a global manual scan started while we were running, let it win — it will produce
@@ -801,7 +851,7 @@ async function scanChangedFiles(specificFiles?: string[]): Promise<void> {
         try {
           const document = await vscode.workspace.openTextDocument(path.join(workspaceRoot, file));
           const diff = await git.diff([file]);
-          const issues = await auditFile(config, file, buildDiffScanPrompt(file, document.getText(), diff, language, rules), token, (delta) => {
+          const issues = await auditFile(config, file, buildDiffScanPrompt(file, document.getText(), diff, language, rules, config.contextLength), token, (delta) => {
             // Accumulate raw SSE deltas; emit at most every 3s to avoid flooding.
             thoughtAccum += delta;
             const now = Date.now();
@@ -937,7 +987,7 @@ async function scanFullProject(): Promise<void> {
         let thoughtAccum = '';
         let lastThoughtTs = 0;
         try {
-          const issues = await auditFile(config, relFile, buildFullScanPrompt(relFile, content, language, rules), token, (delta) => {
+          const issues = await scanFileContent(config, relFile, content, language, rules, token, (delta) => {
             // Accumulate raw SSE deltas; emit at most every 3s to avoid flooding.
             thoughtAccum += delta;
             const now = Date.now();
@@ -975,6 +1025,44 @@ async function scanFullProject(): Promise<void> {
   await saveScanCache(scanCache, workspaceRoot, relFiles);
 }
 
+// Scans file content as a single request if it fits within the context window, or splits
+// it into overlapping line-aligned chunks and merges the results (deduplicating by rule+line).
+async function scanFileContent(
+  config: AuditConfig, relPath: string, content: string,
+  language: string, rules: SemgrepRule[],
+  cancelToken?: vscode.CancellationToken, onThinking?: (text: string) => void,
+  logPrefix?: string, extraAbortSignal?: AbortSignal
+): Promise<any[]> {
+  const rulesSection = formatRulesSection(language, rules);
+  const maxChars = calcContentMaxChars(config.contextLength, rulesSection);
+  const chunks = chunkLines(content, maxChars);
+
+  if (chunks.length === 1) {
+    return auditFile(config, relPath, buildFullScanPrompt(relPath, content, language, rules),
+      cancelToken, onThinking, logPrefix, extraAbortSignal);
+  }
+
+  const totalLines = content.split('\n').length;
+  if (logPrefix) {
+    outputChannel.appendLine(`[${logPrefix}]   📄 File exceeds context window — scanning in ${chunks.length} chunks (${content.length.toLocaleString()} chars)`);
+  }
+
+  const allIssues: any[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < chunks.length; i++) {
+    if (cancelToken?.isCancellationRequested || extraAbortSignal?.aborted) { break; }
+    const { text, startLine, endLine } = chunks[i];
+    const chunkPrefix = logPrefix ? `${logPrefix} [${i + 1}/${chunks.length}]` : undefined;
+    const prompt = buildChunkScanPrompt(relPath, text, startLine, endLine, totalLines, language, rules);
+    const issues = await auditFile(config, relPath, prompt, cancelToken, onThinking, chunkPrefix, extraAbortSignal);
+    for (const issue of issues) {
+      const key = `${issue.ruleId ?? ''}:${issue.startLine ?? 0}:${(issue.message ?? '').slice(0, 40)}`;
+      if (!seen.has(key)) { seen.add(key); allIssues.push(issue); }
+    }
+  }
+  return allIssues;
+}
+
 async function auditFile(config: AuditConfig, _file: string, userPrompt: string, cancelToken?: vscode.CancellationToken, onThinking?: (text: string) => void, logPrefix?: string, extraAbortSignal?: AbortSignal): Promise<any[]> {
   const controller = new AbortController();
   const cancelSub = cancelToken?.onCancellationRequested(() => controller.abort());
@@ -991,6 +1079,7 @@ async function auditFile(config: AuditConfig, _file: string, userPrompt: string,
         model: config.model,
         temperature: config.temperature,
         stream: true,
+        options: { num_ctx: config.contextLength },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content: userPrompt }
